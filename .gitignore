@@ -1,0 +1,20 @@
+# Virtual Environment
+venv/
+env/
+.env/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Dependencies
+pip-log.txt
+pip-delete-this-directory.txt
+
+# VSCode
+.vscode/
+
+# Ruff Formatting
+.ruff_cache/
