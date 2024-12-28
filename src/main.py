@@ -1,11 +1,17 @@
 import os
+from typing import List, Dict, Any
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pandas as pd
 from torch.optim import AdamW
+from torch.amp import autocast, GradScaler
 from transformers import (
     VideoMAEForVideoClassification,
+    AutoImageProcessor,
 )
+
 from dataset import get_train_dataloader, get_test_dataloader
 from config import (
     GPU_ENV_CONFIG,
@@ -14,12 +20,14 @@ from config import (
     ID_TO_CAUSE,
     CAUSE_TO_CATEGORY,
 )
-from torch.amp import autocast, GradScaler
-import torch.nn.functional as F
-from pathlib import Path
 
 
 def setup_gpu() -> torch.device:
+    """Configure GPU settings and return device.
+
+    Raises:
+        RuntimeError: If no GPU is available
+    """
     if not torch.cuda.is_available():
         raise RuntimeError("No GPU detected. This script requires an NVIDIA GPU.")
 
@@ -37,137 +45,236 @@ def setup_gpu() -> torch.device:
 
 
 class DirectCauseClassifier(nn.Module):
-    def __init__(self):
+    """Video classifier for accident cause prediction."""
+
+    def __init__(self) -> None:
         super().__init__()
-        self.video_model = VideoMAEForVideoClassification.from_pretrained(
-            MODEL_CONFIG["model_name"],
-            num_labels=MODEL_CONFIG["num_causes"],
-            ignore_mismatched_sizes=True,
-            image_size=MODEL_CONFIG["frame_size"],
-            num_frames=MODEL_CONFIG["num_frames"],
+        self.image_processor = self._init_image_processor()
+        self.video_model = self._init_video_model()
+
+    def _init_image_processor(self) -> AutoImageProcessor:
+        """Initialize the image processor with model config settings."""
+        return AutoImageProcessor.from_pretrained(
+            MODEL_CONFIG.model_name,
+            do_resize=True,
+            size={
+                "height": MODEL_CONFIG.frame_size,
+                "width": MODEL_CONFIG.frame_size,
+            },
+            do_center_crop=True,
+            crop_size={
+                "height": MODEL_CONFIG.frame_size,
+                "width": MODEL_CONFIG.frame_size,
+            },
+            do_rescale=True,
+            do_normalize=True,
         )
 
-    def forward(self, pixel_values):
-        if pixel_values.dim() == 4:  # (T, C, H, W)
-            pixel_values = pixel_values.unsqueeze(0)  # Add batch dimension
-        elif pixel_values.dim() == 5:  # (B, T, C, H, W)
-            pass
-        else:
-            raise ValueError(f"Expected 4D or 5D tensor, got {pixel_values.dim()}D")
-        return self.video_model(pixel_values).logits
+    def _init_video_model(self) -> VideoMAEForVideoClassification:
+        """Initialize the video classification model."""
+        return VideoMAEForVideoClassification.from_pretrained(
+            MODEL_CONFIG.model_name,
+            num_labels=MODEL_CONFIG.num_causes,
+            ignore_mismatched_sizes=True,
+            image_size=MODEL_CONFIG.frame_size,
+            num_frames=MODEL_CONFIG.num_frames,
+        )
+
+    def forward(self, frames_list: List[torch.Tensor]) -> torch.Tensor:
+        """Process frames and return classification logits."""
+        # Process each video in the batch
+        inputs = self.image_processor(
+            [
+                list(frames) if not isinstance(frames, list) else frames
+                for frames in frames_list
+            ],
+            return_tensors="pt",
+        )
+
+        # Move processed frames to model's device
+        pixel_values = inputs.pixel_values.to(self.video_model.device)
+        return self.video_model(pixel_values=pixel_values).logits
 
 
-def train_model(device: torch.device) -> DirectCauseClassifier:
-    if not Path(MODEL_CONFIG["train_root"]).exists():
-        raise ValueError(f"Training directory not found: {MODEL_CONFIG['train_root']}")
-    if not Path(MODEL_CONFIG["train_csv"]).exists():
-        raise ValueError(f"Training CSV not found: {MODEL_CONFIG['train_csv']}")
+class ModelTrainer:
+    """Handles model training and prediction."""
 
-    model = DirectCauseClassifier().to(device)
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs!")
-        model = nn.DataParallel(model)
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.model = self._initialize_model()
+        self.scaler = GradScaler() if TRAINING_CONFIG.mixed_precision else None
 
-    train_loader = get_train_dataloader(
-        MODEL_CONFIG["train_root"], MODEL_CONFIG["train_csv"]
-    )
-    optimizer = AdamW(
-        model.parameters(),
-        lr=TRAINING_CONFIG["learning_rate"],
-        weight_decay=TRAINING_CONFIG["weight_decay"],
-    )
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=TRAINING_CONFIG["learning_rate"],
-        epochs=TRAINING_CONFIG["num_epochs"],
-        steps_per_epoch=len(train_loader),
-    )
-    scaler = GradScaler("cuda") if TRAINING_CONFIG["mixed_precision"] else None
-    best_loss = float("inf")
-    patience_counter = 0
+    def _initialize_model(self) -> nn.Module:
+        """Initialize and configure the model."""
+        model = DirectCauseClassifier().to(self.device)
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs!")
+            model = nn.DataParallel(model)
+        return model
 
-    for epoch in range(TRAINING_CONFIG["num_epochs"]):
-        model.train()
+    def _validate_paths(self) -> None:
+        """Validate required paths exist."""
+        if not MODEL_CONFIG.train_root.exists():
+            raise ValueError(f"Training directory not found: {MODEL_CONFIG.train_root}")
+        if not MODEL_CONFIG.train_csv.exists():
+            raise ValueError(f"Training CSV not found: {MODEL_CONFIG.train_csv}")
+
+    def train(self) -> None:
+        """Train the model."""
+        self._validate_paths()
+
+        train_loader = get_train_dataloader(
+            MODEL_CONFIG.train_root, MODEL_CONFIG.train_csv
+        )
+        optimizer = self._setup_optimizer()
+        scheduler = self._setup_scheduler(train_loader, optimizer)
+
+        best_loss = float("inf")
+        patience_counter = 0
+
+        for epoch in range(TRAINING_CONFIG.num_epochs):
+            avg_loss = self._train_epoch(train_loader, optimizer, scheduler, epoch)
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                patience_counter = 0
+                self._save_model()
+            else:
+                patience_counter += 1
+                if patience_counter >= TRAINING_CONFIG.patience:
+                    print("Early stopping triggered")
+                    break
+
+        self._load_best_model()
+
+    def _train_epoch(
+        self,
+        train_loader: torch.utils.data.DataLoader,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler._LRScheduler,
+        epoch: int,
+    ) -> float:
+        """Train for one epoch and return average loss."""
+        self.model.train()
         epoch_losses = []
 
         for batch_idx, batch in enumerate(train_loader):
-            pixel_values = batch["pixel_values"].to(device, non_blocking=True)
-            cause_ids = batch["cause_id"].to(device, non_blocking=True)
-
-            with autocast("cuda", enabled=TRAINING_CONFIG["mixed_precision"]):
-                optimizer.zero_grad(set_to_none=True)
-                logits = model(pixel_values)
-                loss = F.cross_entropy(logits, cause_ids)
-
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), TRAINING_CONFIG["clip_grad_norm"]
-                    )
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), TRAINING_CONFIG["clip_grad_norm"]
-                    )
-                    optimizer.step()
-
+            loss = self._train_step(batch, optimizer)
             scheduler.step()
-            epoch_losses.append(loss.item())
+            epoch_losses.append(loss)
 
             if batch_idx % 10 == 0:
-                print(
-                    f"Epoch {epoch+1}/{TRAINING_CONFIG['num_epochs']} | "
-                    f"Batch {batch_idx}/{len(train_loader)} | "
-                    f"Loss: {loss.item():.4f}"
-                )
+                self._log_progress(batch_idx, len(train_loader), loss, epoch)
 
-        avg_loss = sum(epoch_losses) / len(epoch_losses)
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), "best_model.pth")
-        else:
-            patience_counter += 1
-            if patience_counter >= TRAINING_CONFIG["patience"]:
-                print("Early stopping triggered")
-                break
+        return sum(epoch_losses) / len(epoch_losses)
 
-    model.load_state_dict(torch.load("best_model.pth"))
-    return model
+    def _train_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        optimizer: torch.optim.Optimizer,
+    ) -> float:
+        """Perform single training step."""
+        pixel_values = batch["pixel_values"].to(self.device, non_blocking=True)
+        cause_ids = batch["cause_id"].to(self.device, non_blocking=True)
+
+        with autocast(self.device.type, enabled=TRAINING_CONFIG.mixed_precision):
+            optimizer.zero_grad(set_to_none=True)
+            logits = self.model(pixel_values)
+            loss = F.cross_entropy(logits, cause_ids)
+
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(optimizer)
+                self._clip_gradients()
+                self.scaler.step(optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                self._clip_gradients()
+                optimizer.step()
+
+        return loss.item()
+
+    def predict(self, test_loader: torch.utils.data.DataLoader) -> List[Dict[str, Any]]:
+        """Generate predictions for test data."""
+        self.model.eval()
+        predictions = []
+
+        with torch.no_grad():
+            for batch in test_loader:
+                batch_predictions = self._predict_batch(batch)
+                predictions.extend(batch_predictions)
+
+        return predictions
+
+    def _predict_batch(self, batch: Dict[str, torch.Tensor]) -> List[Dict[str, Any]]:
+        """Generate predictions for a single batch."""
+        pixel_values = batch["pixel_values"].to(self.device)
+        video_names = batch["video_name"]
+
+        logits = self.model(pixel_values)
+        pred_cause_ids = torch.argmax(logits, dim=1)
+
+        return [
+            {
+                "video_name": name,
+                "predicted_category": CAUSE_TO_CATEGORY[ID_TO_CAUSE[cause_id.item()]],
+                "predicted_cause": ID_TO_CAUSE[cause_id.item()],
+            }
+            for name, cause_id in zip(video_names, pred_cause_ids)
+        ]
+
+    def _setup_optimizer(self) -> AdamW:
+        """Initialize the optimizer."""
+        return AdamW(
+            self.model.parameters(),
+            lr=TRAINING_CONFIG.learning_rate,
+            weight_decay=TRAINING_CONFIG.weight_decay,
+        )
+
+    def _setup_scheduler(
+        self,
+        train_loader: torch.utils.data.DataLoader,
+        optimizer: torch.optim.Optimizer,
+    ) -> torch.optim.lr_scheduler.OneCycleLR:
+        """Initialize the learning rate scheduler."""
+        return torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=TRAINING_CONFIG.learning_rate,
+            epochs=TRAINING_CONFIG.num_epochs,
+            steps_per_epoch=len(train_loader),
+        )
+
+    def _clip_gradients(self) -> None:
+        """Clip gradients to prevent exploding gradients."""
+        torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), TRAINING_CONFIG.clip_grad_norm
+        )
+
+    def _save_model(self) -> None:
+        """Save model state dict."""
+        torch.save(self.model.state_dict(), "best_model.pth")
+
+    def _load_best_model(self) -> None:
+        """Load best model state dict."""
+        self.model.load_state_dict(torch.load("best_model.pth"))
+
+    @staticmethod
+    def _log_progress(
+        batch_idx: int, total_batches: int, loss: float, epoch: int
+    ) -> None:
+        """Log training progress."""
+        print(
+            f"Epoch {epoch+1}/{TRAINING_CONFIG.num_epochs} | "
+            f"Batch {batch_idx}/{total_batches} | "
+            f"Loss: {loss:.4f}"
+        )
 
 
-def predict(model, test_loader, device):
-    model.eval()
-    predictions = []
-
-    with torch.no_grad():
-        for batch in test_loader:
-            pixel_values = batch["pixel_values"].to(device)
-            video_names = batch["video_name"]
-
-            logits = model(pixel_values)
-            pred_cause_ids = torch.argmax(logits, dim=1)
-
-            for name, cause_id in zip(video_names, pred_cause_ids):
-                cause = ID_TO_CAUSE[cause_id.item()]
-                category = CAUSE_TO_CATEGORY[cause]
-                predictions.append(
-                    {
-                        "video_name": name,
-                        "predicted_category": category,
-                        "predicted_cause": cause,
-                    }
-                )
-
-    return predictions
-
-
-def main():
+def main() -> None:
+    """Main execution function."""
     # Apply NVIDIA environment variables
-    os.environ.update(GPU_ENV_CONFIG)
+    os.environ.update(GPU_ENV_CONFIG.env_dict)
 
     # Setup device
     device = setup_gpu()
@@ -175,16 +282,17 @@ def main():
     torch.autograd.set_detect_anomaly(False)
 
     print("Starting training pipeline...")
+    trainer = ModelTrainer(device)
+    trainer.train()
 
-    model = train_model(device=device)
     print("\nGenerating predictions for test set...")
     test_loader = get_test_dataloader()
-    predictions = predict(model, test_loader, device)
+    predictions = trainer.predict(test_loader)
 
     # Save predictions
     predictions_df = pd.DataFrame(predictions)
-    predictions_df.to_csv(MODEL_CONFIG["output_path"], index=False)
-    print(f"\nPredictions saved to: {MODEL_CONFIG['output_path']}")
+    predictions_df.to_csv(MODEL_CONFIG.output_path, index=False)
+    print(f"\nPredictions saved to: {MODEL_CONFIG.output_path}")
 
 
 if __name__ == "__main__":
