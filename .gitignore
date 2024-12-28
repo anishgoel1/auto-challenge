@@ -18,3 +18,4 @@ pip-delete-this-directory.txt
 
 # Ruff Formatting
 .ruff_cache/
+best_model.pth
