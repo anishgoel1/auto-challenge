@@ -1,4 +1,5 @@
 ## Traffic Accident Video Classification Challenge
+Classification of traffic accidents into labels and causes (categorical) using only video data. Approach: I noticed from the training data that the causes to labels mapping is nearly deterministic. In this sense, there is a very clear correlation between the causes and the labels. As a result, I trained a VideoMAE model to classify the videos into the number of possible of causes and then used the cause to label mapping to get the labels. 
 
 ### Getting Started
 1. Clone the repository and set up Git LFS

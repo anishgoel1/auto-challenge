@@ -9,7 +9,6 @@ from torch.optim import AdamW
 from torch.amp import autocast, GradScaler
 from transformers import (
     VideoMAEForVideoClassification,
-    AutoImageProcessor,
 )
 
 from dataset import get_train_dataloader, get_test_dataloader
@@ -49,26 +48,7 @@ class DirectCauseClassifier(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.image_processor = self._init_image_processor()
         self.video_model = self._init_video_model()
-
-    def _init_image_processor(self) -> AutoImageProcessor:
-        """Initialize the image processor with model config settings."""
-        return AutoImageProcessor.from_pretrained(
-            MODEL_CONFIG.model_name,
-            do_resize=True,
-            size={
-                "height": MODEL_CONFIG.frame_size,
-                "width": MODEL_CONFIG.frame_size,
-            },
-            do_center_crop=True,
-            crop_size={
-                "height": MODEL_CONFIG.frame_size,
-                "width": MODEL_CONFIG.frame_size,
-            },
-            do_rescale=True,
-            do_normalize=True,
-        )
 
     def _init_video_model(self) -> VideoMAEForVideoClassification:
         """Initialize the video classification model."""
@@ -80,20 +60,19 @@ class DirectCauseClassifier(nn.Module):
             num_frames=MODEL_CONFIG.num_frames,
         )
 
-    def forward(self, frames_list: List[torch.Tensor]) -> torch.Tensor:
-        """Process frames and return classification logits."""
-        # Process each video in the batch
-        inputs = self.image_processor(
-            [
-                list(frames) if not isinstance(frames, list) else frames
-                for frames in frames_list
-            ],
-            return_tensors="pt",
-        )
-
-        # Move processed frames to model's device
-        pixel_values = inputs.pixel_values.to(self.video_model.device)
-        return self.video_model(pixel_values=pixel_values).logits
+    def forward(self, frames_batch: torch.Tensor) -> torch.Tensor:
+        """Process frames and return classification logits.
+        
+        Args:
+            frames_batch: shape (B, T, H, W, C)
+        """
+        # Rearrange from (B, T, H, W, C) to (B, T, C, H, W)
+        frames = frames_batch.permute(0, 1, 4, 2, 3)
+        
+        # Normalize to [0, 1]
+        frames = frames.float() / 255.0
+        
+        return self.video_model(pixel_values=frames).logits
 
 
 class ModelTrainer:
@@ -106,10 +85,13 @@ class ModelTrainer:
 
     def _initialize_model(self) -> nn.Module:
         """Initialize and configure the model."""
-        model = DirectCauseClassifier().to(self.device)
+        model = DirectCauseClassifier()
+        model = model.to(self.device)  # Move entire model to device once
+        
         if torch.cuda.device_count() > 1:
             print(f"Using {torch.cuda.device_count()} GPUs!")
             model = nn.DataParallel(model)
+        
         return model
 
     def _validate_paths(self) -> None:
@@ -173,14 +155,19 @@ class ModelTrainer:
         batch: Dict[str, torch.Tensor],
         optimizer: torch.optim.Optimizer,
     ) -> float:
-        """Perform single training step."""
+        """Perform single training step with label smoothing."""
         pixel_values = batch["pixel_values"].to(self.device, non_blocking=True)
         cause_ids = batch["cause_id"].to(self.device, non_blocking=True)
 
         with autocast(self.device.type, enabled=TRAINING_CONFIG.mixed_precision):
             optimizer.zero_grad(set_to_none=True)
             logits = self.model(pixel_values)
-            loss = F.cross_entropy(logits, cause_ids)
+            # Add label smoothing to loss
+            loss = F.cross_entropy(
+                logits, 
+                cause_ids,
+                label_smoothing=TRAINING_CONFIG.label_smoothing
+            )
 
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()

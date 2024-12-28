@@ -32,6 +32,7 @@ class TrainingConfig:
     pin_memory: bool = True
     mixed_precision: bool = True
     amp_dtype: str = "float16"
+    label_smoothing: float = 0.1
 
 
 @dataclass
