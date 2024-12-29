@@ -23,10 +23,10 @@ class GPUConfig:
 @dataclass
 class TrainingConfig:
     num_epochs: int = 30
-    batch_size: int = 8
-    learning_rate: float = 1e-4
-    patience: int = 7
-    weight_decay: float = 0.05
+    batch_size: int = 2
+    learning_rate: float = 5e-5
+    patience: int = 5
+    weight_decay: float = 0.02
     clip_grad_norm: float = 5.0
     num_workers: int = 8
     pin_memory: bool = True
@@ -44,7 +44,9 @@ class ModelConfig:
     num_causes: int = 0  # Will be set after TEMPLATES processing
     frame_size: int = 224
     num_frames: int = 32
-    model_name: str = "MCG-NJU/videomae-base-finetuned-kinetics"
+    model_name: str = "MCG-NJU/videomae-large-finetuned-kinetics"
+    num_clips: int = 4
+    clip_overlap: float = 0.2  
 
 
 # Initialize configs

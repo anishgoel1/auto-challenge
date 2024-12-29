@@ -64,15 +64,29 @@ class DirectCauseClassifier(nn.Module):
         """Process frames and return classification logits.
         
         Args:
-            frames_batch: shape (B, T, H, W, C)
+            frames_batch: shape (B, num_clips, T, H, W, C)
+        Returns:
+            logits: shape (B, num_labels)
         """
-        # Rearrange from (B, T, H, W, C) to (B, T, C, H, W)
-        frames = frames_batch.permute(0, 1, 4, 2, 3)
+        B, num_clips, T, H, W, C = frames_batch.shape
+        
+        # Reshape to process all clips at once
+        frames = frames_batch.view(B * num_clips, T, H, W, C)
+        
+        # Rearrange from (B*num_clips, T, H, W, C) to (B*num_clips, T, C, H, W)
+        frames = frames.permute(0, 1, 4, 2, 3)
         
         # Normalize to [0, 1]
         frames = frames.float() / 255.0
         
-        return self.video_model(pixel_values=frames).logits
+        # Get predictions for all clips
+        logits = self.video_model(pixel_values=frames).logits
+        
+        # Reshape back to (B, num_clips, num_labels)
+        logits = logits.view(B, num_clips, -1)
+        
+        # Average predictions across clips
+        return logits.mean(dim=1)  # Shape: (B, num_labels)
 
 
 class ModelTrainer:
